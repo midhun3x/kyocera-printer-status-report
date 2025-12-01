@@ -1,0 +1,211 @@
+from pysnmp.hlapi import *
+from ping3 import ping
+from datetime import timedelta, datetime
+import xml.etree.ElementTree as ET
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import os
+import time
+
+# Load printer + email config from XML
+def load_config(xml_path="config.xml"):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    return {
+        "printer_ip": root.findtext("printer/ip"),
+        "community": root.findtext("printer/community", "public"),
+        "smtp_server": root.findtext("email/smtp/server"),
+        "smtp_port": int(root.findtext("email/smtp/port")),
+        "smtp_user": root.findtext("email/smtp/username"),
+        "smtp_pass": root.findtext("email/smtp/password"),
+        "from_email": root.findtext("email/from"),
+        "to_email": root.findtext("email/to"),
+        "cc_email": root.findtext("email/cc", ""),
+        "subject": root.findtext("email/subject")
+    }
+
+def is_reachable(ip):
+    try:
+        return ping(ip, timeout=2) is not None
+    except Exception:
+        return False
+
+def ticks_to_human(ticks):
+    try:
+        seconds = int(ticks) // 100
+        return str(timedelta(seconds=seconds))
+    except:
+        return str(ticks)
+
+def snmp_get(ip, oid, community='public'):
+    try:
+        iterator = getCmd(
+            SnmpEngine(),
+            CommunityData(community, mpModel=1),
+            UdpTransportTarget((ip, 161), timeout=2, retries=1),
+            ContextData(),
+            ObjectType(ObjectIdentity(oid))
+        )
+        errorIndication, errorStatus, errorIndex, varBinds = next(iterator)
+        if errorIndication:
+            return f"⚠️ {errorIndication}"
+        elif errorStatus:
+            return f"⚠️ {errorStatus.prettyPrint()}"
+        else:
+            return varBinds[0][1]
+    except Exception as e:
+        return f"❌ {e}"
+
+def fetch_printer_data(ip, community='public'):
+    if not is_reachable(ip):
+        return f"<p>❌ Printer at {ip} is not reachable.</p>"
+
+    oids = {
+        "Model Name": "1.3.6.1.2.1.43.5.1.1.16.1",
+        "Serial Number": "1.3.6.1.2.1.43.5.1.1.17.1",
+        "Uptime": "1.3.6.1.2.1.1.3.0",
+        "Printed Pages": "1.3.6.1.4.1.1347.42.3.1.1.1.1.1",
+        "Copied Pages": "1.3.6.1.4.1.1347.42.3.1.1.1.1.2",
+        "Total Printed Pages": "1.3.6.1.4.1.1347.43.10.1.1.12.1.1"
+    }
+
+    rows = []
+    for label, oid in oids.items():
+        value = snmp_get(ip, oid, community)
+        if label == "Uptime" and str(value).isdigit():
+            value = ticks_to_human(value)
+        
+        if label == "Total Printed Pages":
+            rows.append(f"<tr style='font-weight: bold; background-color: #f9f9f9;'><td>{label}</td><td>{value}</td></tr>")
+        else:
+            rows.append(f"<tr><td>{label}</td><td>{value}</td></tr>")
+
+
+    report_time = datetime.now().strftime("%d %B %Y at %I:%M %p")
+
+    # return f"""
+    # <h3>Kyocera Printer Status Page Report : Company Name</h3>
+    # <h4>Report for Printer: {ip}</h4>
+    # <h4>Printed Pages	</h4>
+    # <div class="timestamp">Report generated on: {report_time}</div>
+    # <table border="1" cellpadding="5" cellspacing="0">
+        # <tr><th>Parameter</th><th>Value</th></tr>
+        # {''.join(rows)}
+    # </table>
+    # <p style="font-size:10px;color:#888;">
+    # This is an automated report sent from a trusted internal printer monitoring tool. Please mark this sender as safe to ensure proper delivery.
+    # </p>
+    # """
+    return f"""
+    <html>
+    <head>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            color: #333;
+        }}
+        h2 {{
+            background-color: #2d89ef;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+        }}
+        h4 {{
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }}
+        th {{
+            background-color: #2d89ef;
+            color: white;
+            padding: 10px;
+            text-align: left;
+            border: 1px solid #ccc;
+        }}
+        td {{
+            padding: 10px;
+            border: 1px solid #ccc;
+        }}
+        tr:hover {{
+            background-color: #f1f1f1;
+        }}
+        .footer {{
+            font-size: 11px;
+            color: #888;
+            margin-top: 30px;
+        }}
+    </style>
+    </head>
+    <body>
+        <h2>Kyocera Printer Status Page Report : Company Name</h2>
+        <h4>Device IP: {ip}</h4>
+		<div class="timestamp">Report generated on: {report_time}</div>
+        <table>
+            <tr><th>Parameter</th><th>Value</th></tr>
+            {''.join(rows)}
+        </table>
+        <p class="footer">
+            This is an automated report generated by your internal printer monitoring system.<br>
+            If this message was marked as junk, please add the sender to your safe list to ensure future delivery.
+        </p>
+    </body>
+    </html>
+    """
+
+
+def write_log(html_content):
+    today = datetime.now().strftime("%Y-%m-%d")
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+    filepath = os.path.join(logs_dir, f"{today}.html")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"📝 Log saved to: {filepath}")
+
+def send_email(config, body_html, max_retries=3, delay_seconds=600):
+    to_list = [config["to_email"]]
+    cc_list = [cc.strip() for cc in config.get("cc_email", "").split(",") if cc.strip()]
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = config["subject"]
+    msg["From"] = config["from_email"]
+    msg["To"] = config["to_email"]
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+
+    plain_text = "SNMP Printer Report. View this message in HTML format for the full report."
+    msg.attach(MIMEText(plain_text, "plain"))
+    msg.attach(MIMEText(body_html, "html"))
+
+    all_recipients = to_list + cc_list
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            with smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=10) as server:
+                server.starttls()
+                server.login(config["smtp_user"], config["smtp_pass"])
+                server.sendmail(config["from_email"], all_recipients, msg.as_string())
+            print(f"✅ Email sent to: {msg['To']}")
+            if cc_list:
+                print(f"📧 CC sent to: {msg['Cc']}")
+            return
+        except Exception as e:
+            print(f"❌ Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                print(f"🔁 Retrying in {delay_seconds // 60} minutes...")
+                time.sleep(delay_seconds)
+            else:
+                print("❌ All retry attempts failed.")
+
+# === Main ===
+if __name__ == "__main__":
+    config = load_config()
+    report_html = fetch_printer_data(config["printer_ip"], config["community"])
+    write_log(report_html)
+    send_email(config, report_html)
