@@ -1,0 +1,18 @@
+<config>
+    <printer>
+        <ip>192.168.1.243</ip>
+        <community>public</community>
+    </printer>
+    <email>
+        <smtp>
+            <server>mail.server.com</server>
+            <port>587</port>
+            <username>sender@mail.com</username>
+            <password>password</password>
+        </smtp>
+        <from>sender@mail.com</from>
+        <to>receiver@mail.com</to>
+		<cc>receiver_cc1@mail.com,receiver_cc2@mail.com</cc>
+        <subject>Kyocera Printer Report - Company NAme</subject>
+    </email>
+</config>
